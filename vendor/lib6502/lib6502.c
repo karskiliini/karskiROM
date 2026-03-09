@@ -582,8 +582,7 @@ enum {
 #define ill(ticks, adrmode)						\
   fetch();								\
   tick(ticks);								\
-  fflush(stdout);							\
-  fprintf(stderr, "\nundefined instruction %02X\n", memory[PC-1]);	\
+  externalise();							\
   return;
 
 #define phR(ticks, adrmode, R)			\
