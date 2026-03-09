@@ -1,0 +1,9 @@
+# Build artifacts
+*.o
+test_bus_sim
+test_trace
+test_c64_harness
+test_iec_low
+test_iec_high
+test_jiffydos
+test_lz4_load

@@ -10,6 +10,7 @@
  * success or appropriate error codes.
  */
 
+#include "mock_hardware.h"
 #include "fat12.h"
 #include <string.h>
 

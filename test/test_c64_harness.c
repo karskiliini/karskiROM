@@ -14,7 +14,8 @@
 #include <assert.h>
 #include "c64_harness.h"
 
-#define KERNAL_PATH "rom/original/kernal-901227-03.bin"
+static const char *kernal_rom_path = "rom/original/kernal-901227-03.bin";
+#define KERNAL_PATH kernal_rom_path
 
 static int tests_run = 0;
 static int tests_passed = 0;
@@ -260,9 +261,11 @@ static void test_dd00_write_updates_bus(void)
 
 /* ------------------------------------------------------------------ */
 
-int main(void)
+int main(int argc, char *argv[])
 {
-    printf("c64_harness tests:\n");
+    if (argc > 1) kernal_rom_path = argv[1];
+
+    printf("c64_harness tests (KERNAL: %s):\n", kernal_rom_path);
 
     RUN_TEST(test_kernal_loads_and_reset_vector);
     RUN_TEST(test_kernal_nmi_vector);

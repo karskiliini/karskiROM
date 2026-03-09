@@ -4,6 +4,11 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+#ifdef HOST_TEST
+/* On host builds, replace AVR headers with mock hardware layer */
+#include "mock_hardware.h"
+#endif
+
 /*
  * Hardware configuration for Alternative E:
  * Arduino Nano (ATmega328P) + 23LC512 SPI SRAM + 74HC595 shift register
@@ -68,6 +73,8 @@
 
 #include <avr/io.h>
 
+#endif /* __AVR__ */
+
 /* IEC bus (direct GPIO, active-low open-collector) */
 #define IEC_PIN_ATN      PD2    /* INT0 interrupt */
 #define IEC_PIN_CLK      PD3
@@ -102,8 +109,6 @@
 #define FLOPPY_IN_DDR       DDRC
 #define FLOPPY_IN_PORT      PORTC
 #define FLOPPY_IN_PINR      PINC
-
-#endif /* __AVR__ */
 
 /* --- 74HC595 Shift Register Bit Assignments --- */
 
