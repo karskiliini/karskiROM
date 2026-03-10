@@ -111,8 +111,8 @@ test_trace: test_trace.o trace.o
 	$(CC) $(CFLAGS) -o $@ $^
 
 # test_c64_harness: needs harness + bus_sim + trace + lib6502 + mock_hardware
-test_c64_harness: test_c64_harness.o c64_harness.o bus_sim.o trace.o \
-                  mock_hardware.o $(LIB6502_OBJ)
+# Also needs all vendor/mock objects since c64_harness now calls firmware_step
+test_c64_harness: test_c64_harness.o $(ALL_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^
 
 # test_iec_low: needs everything (both sides of the bus)

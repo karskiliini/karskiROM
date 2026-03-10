@@ -134,8 +134,12 @@
 #define IEC_CMD_UNLISTEN    0x3F
 #define IEC_CMD_TALK        0x40
 #define IEC_CMD_UNTALK      0x5F
-#define IEC_CMD_OPEN        0x60
+#define IEC_CMD_DATA        0x60   /* SECOND: select data channel (SA 0-15) */
 #define IEC_CMD_CLOSE       0xE0
+#define IEC_CMD_OPEN        0xF0   /* OPEN: open named file on channel (SA 0-15) */
+
+/* Backward compatibility alias */
+#define IEC_CMD_SECOND      IEC_CMD_DATA
 
 /* Secondary addresses */
 #define IEC_SA_LOAD          0

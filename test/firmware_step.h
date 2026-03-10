@@ -17,7 +17,7 @@
  *       resolves AVR-specific dependencies in the firmware code.
  */
 
-typedef struct {
+typedef struct firmware_state {
     bus_state_t *bus;
     trace_log_t *trace;
     bool initialized;

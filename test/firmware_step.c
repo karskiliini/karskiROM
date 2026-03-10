@@ -30,6 +30,11 @@ void firmware_init(firmware_state_t *fw, bus_state_t *bus, trace_log_t *trace)
     fastload_jiffydos_register();
     compress_proto_init();
 
+    /* Sync device GPIO with actual bus state so mock_PIND reflects
+     * reality (all lines released) rather than mock_hardware_init's
+     * default of all zeros (which would look like ATN asserted). */
+    bus_sim_sync_device(bus);
+
     fw->initialized = true;
 }
 

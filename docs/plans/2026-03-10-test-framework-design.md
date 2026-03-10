@@ -44,44 +44,55 @@ shared IEC bus simulator.
 | Timing model | Cooperative + jitter tests | Deterministic, debuggable |
 | Verification | IEC protocol trace (sequence + timing tolerance) | Catches protocol-level bugs |
 
-## Cooperative Loop
+## Cooperative Scheduling via $DD00 Callbacks
 
-```c
-typedef struct {
-    int step_cycles;        // base step size
-    int jitter_range;       // 0 = no jitter, >0 = random +/-N
-    uint32_t jitter_seed;   // reproducibility
-} sim_config_t;
+**Alkuperäinen suunnitelma** oli erillinen cooperative loop joka vuorottelee
+C64:n ja firmwaren ajoa. Tämä ei toimi käytännössä koska:
 
-void sim_tick(sim_state_t *sim) {
-    int cycles = sim->config.step_cycles;
+1. `M6502_run()` ajaa CPU:ta kunnes kohtaa laittoman opkoodin — ei tue cycle-rajattua ajoa
+2. `iec_service()` käyttää busy-wait-pollausta — ei palauta kontrollia ennen kuin operaatio on valmis
 
-    if (sim->config.jitter_range > 0) {
-        int jitter = (rand_r(&sim->config.jitter_seed)
-                      % (2 * sim->config.jitter_range + 1))
-                      - sim->config.jitter_range;
-        cycles += jitter;
-        if (cycles < 1) cycles = 1;
-    }
+**Ratkaisu: $DD00-callback-pohjainen scheduling.**
 
-    c64_harness_run(sim->c64, cycles);
-    bus_sim_advance(&sim->bus, cycles);
-    firmware_step(sim->fw, cycles);
-    trace_record(&sim->trace, sim->total_cycles, &sim->bus);
-    sim->total_cycles += cycles;
-}
+IEC-bussiprotokolla käyttää CIA2:n porttia A ($DD00) jokaiseen operaatioon.
+lib6502 kutsuu callbackiamme automaattisesti jokaisella $DD00 kirjoituksella
+ja lukemisella. Callbackin sisällä annamme firmwarelle suoritusaikaa:
+
+```
+KERNAL ajaa 6502-koodia
+    |
+    ├── kirjoittaa $DD00 (esim. assertoi ATN)
+    │       └── dd00_write callback:
+    │               1. bus_sim_c64_write() — päivitä bussi
+    │               2. firmware_step() x N — anna firmwaren reagoida
+    │               3. trace — tallenna bussimuutokset
+    │
+    ├── lukee $DD00 (esim. tarkistaa DATA IN)
+    │       └── dd00_read callback:
+    │               1. firmware_step() x N — anna firmwaren reagoida
+    │               2. bus_sim_sync_device() — synkronoi GPIO → bussi
+    │               3. return bus_sim_c64_read() — palauta bussitila
+    │
+    └── ... jatkaa kunnes RTS → sentinel → M6502_run() palaa
 ```
 
-## Step Sizes
+**Miksi tämä toimii:**
 
-| Test | step_cycles | jitter_range | Rationale |
-|------|-------------|--------------|-----------|
-| test_iec_low | 100 | 0 | Standard IEC, deterministic |
-| test_iec_high | 100 | 0 | LOAD/SAVE, deterministic |
-| test_jiffydos | 5 | 0 | 2-bit, precise timing |
-| test_jiffydos (jitter) | 5 | 3 | Timing sensitivity test |
-| test_lz4_load | 5 | 0 | JiffyDOS + LZ4 |
-| test_lz4_load (jitter) | 5 | 5 | Stress test |
+- KERNAL käyttää $DD00:aa jokaiseen IEC-bussioperaatioon (jokainen bitti,
+  jokainen tavu, jokainen handshake). Ei ole mahdollista tehdä IEC-siirtoa
+  koskematta $DD00:aan.
+- Firmware saa suoritusaikaa täsmälleen silloin kun C64 kommunikoi bussin
+  kanssa — sama kuin oikealla raudalla jossa bussimuutokset etenevät
+  signaalinopeudella.
+- Ei tarvitse modifioida lib6502:ta eikä refaktoroida firmwarea.
+
+**Rajoitukset:**
+
+- Ajoitus ei ole cycle-accurate — firmware saa suoritusaikaa vain $DD00-
+  accessien kohdalla, ei niiden välissä. Käytännössä tämä ei ole ongelma
+  standardille IEC:lle jossa kaikki ajoitus perustuu signaalimuutoksiin.
+- JiffyDOS 2-bit -siirron ~13µs kierrokset vaativat että firmware_step()
+  kutsutaan riittävän monta kertaa per callback.
 
 ## Tested KERNAL Routines
 
@@ -123,12 +134,12 @@ CYCLE     DIR    EVENT              DATA         BUS_STATE
 
 ## Timing Risk Mitigations
 
-The cooperative model does not run both sides truly concurrently. Mitigations:
+Callback-malli ei ole cycle-accurate. Mitigaatiot:
 
-1. **Adjustable step size** — JiffyDOS tests use 5-cycle steps (vs 100 for standard IEC)
-2. **Jitter tests** — each JiffyDOS/LZ4 test runs twice: deterministic + randomized step timing
-3. **Jitter failure = timing bug** — if jitter test fails but deterministic passes, it indicates a timing-sensitive bug that would manifest on real hardware
-4. **Final validation** — VICE emulator + real hardware testing as ultimate verification
+1. **firmware_step() toistokerrat** — callbackin sisällä firmware_step() kutsutaan useita kertoja kunnes bussitila stabiloituu tai max-raja tulee vastaan
+2. **Jitter-testit** — JiffyDOS/LZ4-testeissä firmware_step()-kutsumäärää varioidaan satunnaisesti paljastamaan ajoitusherkät bugit
+3. **Protokollasekvenssin verifiointi** — vaikka tarkkaa sykliajoitusta ei verrata, IEC-eventien järjestys ja data verifioidaan
+4. **Lopullinen validointi** — VICE-emulaattori + oikea rauta testaavat todellisen ajoituksen
 
 ## IEC Bus Simulation
 
