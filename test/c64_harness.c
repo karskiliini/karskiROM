@@ -40,6 +40,18 @@ static firmware_state_t *s_fw    = NULL;
 #define DD00_WATCHDOG_LIMIT  50000
 static uint32_t s_dd00_access_count = 0;
 static bool s_watchdog_triggered = false;
+int c64_dd00_debug = 0;  /* Set to 1 for $DD00 access tracing */
+
+/*
+ * Minimal CIA1 Timer B emulation for ACPTR EOI detection.
+ * ACPTR starts Timer B ($DC0F) and reads $DC0D to check if
+ * the timer expired (bit 1 = Timer B underflow). If the talker
+ * holds CLK released for >timeout, ACPTR detects EOI.
+ * We count $DD00 accesses as a time proxy.
+ */
+#define CIA1_TIMER_B_THRESHOLD  8  /* $DD00 accesses until timer fires */
+static bool s_timer_b_active = false;
+static uint32_t s_timer_b_start = 0;
 
 /* Address in RAM where we plant the watchdog exit trampoline.
  * Must be in writable RAM that the KERNAL won't use. */
@@ -64,6 +76,12 @@ static int dd00_write_cb(M6502 *mpu, uint16_t addr, uint8_t data)
     s_dd00_access_count++;
 
     bus_sim_c64_write(s_bus, data);
+
+    if (c64_dd00_debug && s_dd00_access_count < 3000) {
+        fprintf(stderr, "DD00 W #%u PC=$%04X val=$%02X  ATN=%d CLK=%d DATA=%d\n",
+                s_dd00_access_count, mpu->registers->pc, data,
+                (data >> 3) & 1, (data >> 4) & 1, (data >> 5) & 1);
+    }
 
     if (s_trace) {
         trace_record_bus_change(s_trace, s_bus->cycles,
@@ -167,7 +185,41 @@ static int dd00_read_cb(M6502 *mpu, uint16_t addr, uint8_t data)
     uint8_t stored = mpu->memory[0xDD00];  /* output bits */
     uint8_t bus_in = bus_sim_c64_read(s_bus);  /* input bits (6,7) */
 
-    return (stored & 0x3F) | (bus_in & 0xC0);
+    uint8_t result = (stored & 0x3F) | (bus_in & 0xC0);
+    if (c64_dd00_debug && s_dd00_access_count < 3000) {
+        fprintf(stderr, "DD00 R #%u PC=$%04X result=$%02X  CLK_IN=%d DATA_IN=%d\n",
+                s_dd00_access_count, mpu->registers->pc, result,
+                (result >> 6) & 1, (result >> 7) & 1);
+    }
+    return result;
+}
+
+/* ---- CIA1 Timer B callbacks ($DC07, $DC0D, $DC0F) ---- */
+
+static int dc0f_write_cb(M6502 *mpu, uint16_t addr, uint8_t data)
+{
+    (void)addr;
+    /* Bit 0 = start timer, bit 3 = one-shot, bit 4 = force load.
+     * ACPTR writes $19 to start one-shot timer for EOI detection. */
+    if (data & 0x01) {
+        s_timer_b_active = true;
+        s_timer_b_start = s_dd00_access_count;
+    }
+    mpu->memory[0xDC0F] = data;
+    return 0;
+}
+
+static int dc0d_read_cb(M6502 *mpu, uint16_t addr, uint8_t data)
+{
+    (void)addr;
+    (void)data;
+    uint8_t icr = 0;
+    if (s_timer_b_active &&
+        (s_dd00_access_count - s_timer_b_start) > CIA1_TIMER_B_THRESHOLD) {
+        icr |= 0x02;  /* Timer B underflow */
+        s_timer_b_active = false;  /* One-shot: auto-stop */
+    }
+    return icr;
 }
 
 /* ---- Initialization ---- */
@@ -224,6 +276,10 @@ bool c64_harness_init(c64_harness_t *c64, const char *kernal_path,
     /* Install CIA2 $DD00 callbacks */
     M6502_setCallback(mpu, write, 0xDD00, dd00_write_cb);
     M6502_setCallback(mpu, read,  0xDD00, dd00_read_cb);
+
+    /* Install CIA1 Timer B callbacks for ACPTR EOI detection */
+    M6502_setCallback(mpu, write, 0xDC0F, dc0f_write_cb);
+    M6502_setCallback(mpu, read,  0xDC0D, dc0d_read_cb);
 
     /* Initialize IEC-related zero-page locations */
     mpu->memory[0xBA] = 8;   /* Current device number */
@@ -282,9 +338,10 @@ void c64_harness_call(c64_harness_t *c64, uint16_t addr,
 {
     M6502 *mpu = c64->cpu;
 
-    /* Reset watchdog counter for each new call */
+    /* Reset watchdog and timer state for each new call */
     s_dd00_access_count = 0;
     s_watchdog_triggered = false;
+    s_timer_b_active = false;
 
     /* Push sentinel return address onto 6502 stack.
      * RTS pops low byte, then high byte, then adds 1 to form the PC.

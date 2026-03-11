@@ -33,6 +33,7 @@ extern void mock_fat12_reset(void);
 
 /* External: IEC debug flag */
 extern int iec_debug_enabled;
+extern int c64_dd00_debug;
 
 static const char *kernal_path = NULL;
 
@@ -190,8 +191,6 @@ static void test_load_file(void)
     trace_log_t trace;
     c64_harness_t c64;
     firmware_state_t fw;
-
-    iec_debug_enabled = 1;
 
     bool ok = setup_iec(&c64, &fw, &bus, &trace);
     assert(ok);

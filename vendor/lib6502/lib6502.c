@@ -69,12 +69,12 @@ enum {
 
 #define putMemory(ADDR, BYTE)			\
   ( writeCallback[ADDR]				\
-      ? writeCallback[ADDR](mpu, ADDR, BYTE)	\
+      ? (mpu->registers->pc= PC, writeCallback[ADDR](mpu, ADDR, BYTE))	\
       : (memory[ADDR]= BYTE) )
 
 #define getMemory(ADDR)				\
   ( readCallback[ADDR]				\
-      ?  readCallback[ADDR](mpu, ADDR, 0)	\
+      ? (mpu->registers->pc= PC, readCallback[ADDR](mpu, ADDR, 0))	\
       :  memory[ADDR] )
 
 /* stack access (always direct) */

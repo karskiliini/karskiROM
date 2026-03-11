@@ -392,13 +392,18 @@ typedef enum {
     SM_ATN_WAIT_CLK_HIGH,       /* Bit sampled on CLK low, waiting for CLK high */
     SM_ATN_BYTE_DONE,           /* All 8 bits received, DATA asserted as byte ack */
     /* Talker states (sending data bytes) */
-    SM_TALK_SETUP,              /* CLK asserted, DATA released, waiting for listener ready */
+    SM_TALK_SETUP,              /* CLK asserted, get byte; hold CLK for turnaround */
+    SM_TALK_CLK_HOLD,           /* Hold CLK asserted briefly, then release */
+    SM_TALK_WAIT_LISTENER,      /* CLK released, waiting for listener to release DATA */
     SM_TALK_EOI_WAIT_DATA_LOW,  /* EOI: CLK released, waiting for listener DATA low */
     SM_TALK_EOI_WAIT_DATA_HIGH, /* EOI: waiting for listener DATA release */
-    SM_TALK_SEND_BIT,           /* Set DATA for current bit, assert CLK */
-    SM_TALK_CLK_HIGH,           /* Release CLK to signal bit valid */
+    SM_TALK_SEND_BIT,           /* Set DATA for current bit (CLK stays asserted) */
+    SM_TALK_BIT_SETUP_HOLD,     /* Hold CLK asserted with DATA set for debounce */
+    SM_TALK_CLK_HIGH,           /* CLK released (bit valid), hold for debounce */
     SM_TALK_WAIT_ACK,           /* All bits sent, DATA released, waiting for listener ack */
     /* Listener states (receiving data bytes without ATN) */
+    SM_LISTEN_SYNC,             /* Wait for CLK LOW first (clear leftover HIGH) */
+    SM_LISTEN_SYNC2,            /* Then wait for CLK HIGH (C64 "ready to send") → release DATA */
     SM_LISTEN_READY,            /* DATA released, waiting for CLK low (first bit / EOI detect) */
     SM_LISTEN_EOI_ACK,          /* EOI detected, DATA asserted briefly */
     SM_LISTEN_EOI_RELEASED,     /* EOI ack done, DATA released, waiting for CLK low */
@@ -416,7 +421,7 @@ static uint16_t sm_wait_count;  /* EOI detection counter */
 
 int iec_debug_enabled = 0;
 static int iec_debug_count = 0;
-#define IEC_DBG(fmt, ...) do { if (iec_debug_enabled && iec_debug_count < 200) { iec_debug_count++; fprintf(stderr, fmt, ##__VA_ARGS__); } } while(0)
+#define IEC_DBG(fmt, ...) do { if (iec_debug_enabled && iec_debug_count < 1000) { iec_debug_count++; fprintf(stderr, fmt, ##__VA_ARGS__); } } while(0)
 
 /* Process a received ATN command byte */
 static void iec_process_atn_command(uint8_t cmd) {
@@ -443,13 +448,15 @@ static void iec_process_atn_command(uint8_t cmd) {
             }
             IEC_DBG("IEC: UNLISTEN -> IDLE\n");
             device.state = IEC_STATE_IDLE;
-            iec_release_all();
+            /* Don't release lines here — DATA must stay asserted as the
+             * byte ACK so the C64 can see it.  Lines will be released
+             * when ATN is released (ATN-release edge handler). */
             fastload_reset();
         }
     } else if (cmd == IEC_CMD_UNTALK) {
         if (device.state == IEC_STATE_TALKER) {
             device.state = IEC_STATE_IDLE;
-            iec_release_all();
+            /* Same as UNLISTEN: defer line release to ATN-release edge. */
             fastload_reset();
         }
     } else if ((cmd & 0xE0) == IEC_CMD_LISTEN) {
@@ -464,11 +471,9 @@ static void iec_process_atn_command(uint8_t cmd) {
         /* SECOND/DATA ($60-$6F): select data channel */
         uint8_t sa = cmd & 0x0F;
         device.current_sa = sa;
-
-        if (device.state == IEC_STATE_TALKER) {
-            IEC_RELEASE(IEC_PIN_DATA);
-            IEC_ASSERT(IEC_PIN_CLK);
-        }
+        /* Don't change bus lines here for talker mode — the ATN release
+         * edge handler already does the turnaround (release DATA, assert CLK).
+         * Changing lines here would undo the byte ACK before the C64 sees it. */
     } else if ((cmd & 0xF0) == IEC_CMD_OPEN) {
         /* OPEN ($F0-$FF): open named file on channel */
         uint8_t sa = cmd & 0x0F;
@@ -602,10 +607,13 @@ void iec_service(void) {
             return;
         }
         if (device.state == IEC_STATE_LISTENER) {
-            /* Enter listener mode: ready to receive data */
-            IEC_DBG("IEC: -> LISTEN_READY\n");
-            IEC_RELEASE(IEC_PIN_DATA);
-            sm_state = SM_LISTEN_READY;
+            /* Enter listener sync: keep DATA asserted (from byte ACK).
+             * The C64 checks DATA_IN to verify listener presence before
+             * sending data.  We release DATA only when CLK goes HIGH
+             * (C64 signals "ready to send"). */
+            IEC_DBG("IEC: -> LISTEN_SYNC (DATA held)\n");
+            /* DATA stays asserted from SM_ATN_BYTE_DONE */
+            sm_state = SM_LISTEN_SYNC;
             sm_wait_count = 0;
             sm_eoi = false;
             return;
@@ -750,40 +758,75 @@ void iec_service(void) {
     /* ---- Talker states (sending data bytes to listener) ---- */
 
     case SM_TALK_SETUP: {
-        /* CLK asserted, DATA released. Wait for listener to release DATA. */
+        /* CLK is asserted (talker not ready). Get the byte to send.
+         * Don't wait for DATA — after turnaround the C64 still has DATA
+         * asserted (KERNAL turnaround $EDC7-$EDDC asserts DATA at $EDCD).
+         * Hold CLK asserted briefly so the turnaround's CLK_IN=0 check
+         * at $EDD6 can see it, then release CLK so ACPTR's CLK_IN=1 check
+         * at $EE1B can proceed. */
         if (atn_now) {
             sm_state = SM_IDLE;
             break;
         }
+        uint8_t byte;
+        bool eoi;
+        if (!cbm_dos_talk_byte(device.current_sa, &byte, &eoi)) {
+            /* No more data */
+            IEC_DBG("IEC: TALK no more data, SA=%d\n", device.current_sa);
+            device.state = IEC_STATE_IDLE;
+            iec_release_all();
+            sm_state = SM_IDLE;
+            break;
+        }
+        sm_byte = byte;
+        sm_eoi = eoi;
+        sm_bit = 0;
+        sm_wait_count = 0;
+
+        IEC_DBG("IEC: TALK send $%02X eoi=%d SA=%d\n", byte, eoi, device.current_sa);
+
+        /* Keep CLK asserted; hold it for a delay so turnaround sees CLK LOW */
+        sm_state = SM_TALK_CLK_HOLD;
+        break;
+    }
+
+    case SM_TALK_CLK_HOLD:
+        /* Hold CLK asserted so the turnaround's debounce read ($EEA9)
+         * sees stable CLK_IN=0. The turnaround generates ~38 fw steps
+         * from ATN release to debounce completion (2 subroutine calls
+         * × 2 accesses × 8 steps + 2 debounce reads × 8 steps).
+         * Release CLK at 40+ steps so it transitions during ACPTR's
+         * JSR $EE85 setup, before ACPTR's debounce reads CLK_IN=1.
+         *
+         * Always go to WAIT_LISTENER first. For both EOI and non-EOI,
+         * we need to wait for the listener to release DATA (= ready).
+         * For EOI, WAIT_LISTENER then holds CLK released until the
+         * listener sends the EOI ack pulse. */
+        if (atn_now) { sm_state = SM_IDLE; break; }
+        sm_wait_count++;
+        if (sm_wait_count > 40) {
+            IEC_RELEASE(IEC_PIN_CLK);
+            sm_state = SM_TALK_WAIT_LISTENER;
+        }
+        break;
+
+    case SM_TALK_WAIT_LISTENER:
+        /* CLK released (ready to send). Wait for listener to release DATA
+         * (listener ready signal).
+         * For non-EOI: assert CLK and send first bit.
+         * For EOI: keep CLK released; enter EOI wait for listener ack. */
+        if (atn_now) { sm_state = SM_IDLE; break; }
         if (!IEC_IS_LOW(IEC_PIN_DATA)) {
-            /* Listener ready. Get byte to send. */
-            uint8_t byte;
-            bool eoi;
-            if (!cbm_dos_talk_byte(device.current_sa, &byte, &eoi)) {
-                /* No more data */
-                IEC_DBG("IEC: TALK no more data, SA=%d\n", device.current_sa);
-                device.state = IEC_STATE_IDLE;
-                iec_release_all();
-                sm_state = SM_IDLE;
-                break;
-            }
-            sm_byte = byte;
-            sm_eoi = eoi;
-            sm_bit = 0;
-
-            IEC_DBG("IEC: TALK send $%02X eoi=%d SA=%d\n", byte, eoi, device.current_sa);
-
-            if (eoi) {
-                /* EOI signaling: release CLK */
-                IEC_RELEASE(IEC_PIN_CLK);
+            if (sm_eoi) {
+                /* CLK stays released for EOI timeout detection.
+                 * Wait for listener to pulse DATA low (EOI ack). */
                 sm_state = SM_TALK_EOI_WAIT_DATA_LOW;
             } else {
-                /* Normal byte: start sending bits */
+                IEC_ASSERT(IEC_PIN_CLK);
                 sm_state = SM_TALK_SEND_BIT;
             }
         }
         break;
-    }
 
     case SM_TALK_EOI_WAIT_DATA_LOW:
         /* EOI: CLK released, waiting for listener to pulse DATA low */
@@ -804,29 +847,44 @@ void iec_service(void) {
         break;
 
     case SM_TALK_SEND_BIT:
-        /* Set DATA line for current bit, CLK is asserted */
+        /* Set DATA line for current bit. CLK stays asserted (bit setup). */
         if (atn_now) { sm_state = SM_IDLE; break; }
         if (sm_byte & (1 << sm_bit)) {
             IEC_RELEASE(IEC_PIN_DATA);
         } else {
             IEC_ASSERT(IEC_PIN_DATA);
         }
-        /* Release CLK to signal bit is valid */
-        IEC_RELEASE(IEC_PIN_CLK);
-        sm_state = SM_TALK_CLK_HIGH;
+        sm_wait_count = 0;
+        sm_state = SM_TALK_BIT_SETUP_HOLD;
+        break;
+
+    case SM_TALK_BIT_SETUP_HOLD:
+        /* Hold CLK asserted (bit setup phase) so the C64's debounce
+         * reads see stable CLK_IN=0. Then release CLK = bit valid. */
+        if (atn_now) { sm_state = SM_IDLE; break; }
+        sm_wait_count++;
+        if (sm_wait_count > 24) {
+            IEC_RELEASE(IEC_PIN_CLK);
+            sm_wait_count = 0;
+            sm_state = SM_TALK_CLK_HIGH;
+        }
         break;
 
     case SM_TALK_CLK_HIGH:
-        /* CLK released (bit valid), re-assert CLK for next bit */
+        /* CLK released (bit valid). Hold so C64's debounce reads see
+         * stable CLK_IN=1. Then re-assert CLK for next bit. */
         if (atn_now) { sm_state = SM_IDLE; break; }
-        IEC_ASSERT(IEC_PIN_CLK);
-        sm_bit++;
-        if (sm_bit >= 8) {
-            /* All 8 bits sent -- release DATA, wait for listener ack */
-            IEC_RELEASE(IEC_PIN_DATA);
-            sm_state = SM_TALK_WAIT_ACK;
-        } else {
-            sm_state = SM_TALK_SEND_BIT;
+        sm_wait_count++;
+        if (sm_wait_count > 20) {
+            IEC_ASSERT(IEC_PIN_CLK);
+            sm_bit++;
+            if (sm_bit >= 8) {
+                /* All 8 bits sent -- release DATA, wait for listener ack */
+                IEC_RELEASE(IEC_PIN_DATA);
+                sm_state = SM_TALK_WAIT_ACK;
+            } else {
+                sm_state = SM_TALK_SEND_BIT;
+            }
         }
         break;
 
@@ -849,6 +907,30 @@ void iec_service(void) {
 
     /* ---- Listener states (receiving data bytes without ATN) ---- */
 
+    case SM_LISTEN_SYNC:
+        /* Phase 1: Wait for CLK LOW.
+         * After ATN release or between bytes, CLK may still be HIGH
+         * (e.g., from the last bit's CLK release). We must see CLK go LOW
+         * first to clear any leftover state before waiting for the
+         * "ready to send" CLK HIGH edge in SYNC2. */
+        if (atn_now) { sm_state = SM_IDLE; break; }
+        if (IEC_IS_LOW(IEC_PIN_CLK)) {
+            sm_state = SM_LISTEN_SYNC2;
+        }
+        break;
+
+    case SM_LISTEN_SYNC2:
+        /* Phase 2: Wait for CLK HIGH (C64 releases CLK = "ready to send").
+         * Then release DATA ("ready to receive") and enter LISTEN_READY. */
+        if (atn_now) { sm_state = SM_IDLE; break; }
+        if (!IEC_IS_LOW(IEC_PIN_CLK)) {
+            IEC_DBG("IEC: LISTEN_SYNC2 -> LISTEN_READY (CLK HIGH, DATA released)\n");
+            IEC_RELEASE(IEC_PIN_DATA);
+            sm_state = SM_LISTEN_READY;
+            sm_wait_count = 0;
+        }
+        break;
+
     case SM_LISTEN_READY:
         /* DATA released, waiting for talker to pull CLK low.
          * Do NOT sample DATA here -- talker sets DATA after CLK low.
@@ -856,26 +938,38 @@ void iec_service(void) {
         if (atn_now) { sm_state = SM_IDLE; break; }
         if (IEC_IS_LOW(IEC_PIN_CLK)) {
             /* CLK low -- bit transfer starting. Wait for CLK release. */
+            IEC_DBG("IEC: LISTEN_READY: CLK LOW -> receiving (wc=%u)\n", sm_wait_count);
             sm_byte = 0;
             sm_bit = 0;
             sm_state = SM_LISTEN_WAIT_CLK_HIGH;
         } else {
             /* CLK still high -- increment EOI wait counter */
             sm_wait_count++;
+            if (sm_wait_count == 1) {
+                IEC_DBG("IEC: LISTEN_READY: starting EOI wait (CLK HIGH)\n");
+            }
             if (sm_wait_count > IEC_TIMING_EOI_TIMEOUT) {
                 /* EOI detected -- acknowledge with DATA pulse */
+                IEC_DBG("IEC: LISTEN_READY: EOI detected (wc=%u)\n", sm_wait_count);
                 sm_eoi = true;
                 IEC_ASSERT(IEC_PIN_DATA);
                 sm_state = SM_LISTEN_EOI_ACK;
+                sm_wait_count = 0;
             }
         }
         break;
 
     case SM_LISTEN_EOI_ACK:
-        /* EOI ack: DATA asserted briefly, then release */
+        /* EOI ack: hold DATA asserted long enough for C64 to see it.
+         * Need to span at least one callback boundary (8 steps) so the
+         * C64 gets a chance to read $DD00 and see DATA_IN=0. */
         if (atn_now) { sm_state = SM_IDLE; break; }
-        IEC_RELEASE(IEC_PIN_DATA);
-        sm_state = SM_LISTEN_EOI_RELEASED;
+        sm_wait_count++;
+        if (sm_wait_count > 16) {
+            IEC_DBG("IEC: EOI ACK done, releasing DATA\n");
+            IEC_RELEASE(IEC_PIN_DATA);
+            sm_state = SM_LISTEN_EOI_RELEASED;
+        }
         break;
 
     case SM_LISTEN_EOI_RELEASED:
@@ -920,7 +1014,7 @@ void iec_service(void) {
         break;
 
     case SM_LISTEN_BYTE_DONE:
-        /* Byte received and acknowledged. Process it. */
+        /* Byte received and acknowledged (DATA asserted). Process it. */
         IEC_DBG("IEC: LISTEN byte=$%02X eoi=%d SA=%d\n", sm_byte, sm_eoi, device.current_sa);
         iec_process_listen_byte(sm_byte, sm_eoi);
 
@@ -928,9 +1022,11 @@ void iec_service(void) {
             /* Last byte */
             sm_state = SM_IDLE;
         } else {
-            /* Ready for next byte */
-            IEC_RELEASE(IEC_PIN_DATA);
-            sm_state = SM_LISTEN_READY;
+            /* Ready for next byte. Keep DATA asserted (byte ACK) so
+             * C64 can see it. Enter LISTEN_SYNC which waits for CLK
+             * HIGH (C64 releases CLK for next byte), then releases
+             * DATA ("ready to receive"). */
+            sm_state = SM_LISTEN_SYNC;
             sm_wait_count = 0;
             sm_eoi = false;
         }
