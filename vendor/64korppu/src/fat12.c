@@ -36,6 +36,7 @@ static uint8_t sector_buf[512];
 /* ---- FAT entry access (reads/writes SRAM) ---- */
 
 uint16_t fat12_read_fat_entry(uint16_t cluster) {
+    if (cluster >= FAT12_TOTAL_CLUSTERS + 2) return FAT12_BAD;
     if (!state.mounted) return 0;
 
     uint32_t offset = cluster + (cluster / 2);  /* 1.5 bytes per entry */
@@ -47,6 +48,7 @@ uint16_t fat12_read_fat_entry(uint16_t cluster) {
 }
 
 void fat12_write_fat_entry(uint16_t cluster, uint16_t value) {
+    if (cluster >= FAT12_TOTAL_CLUSTERS + 2) return;
     if (!state.mounted) return;
 
     uint32_t offset = cluster + (cluster / 2);
@@ -212,6 +214,8 @@ int fat12_read(fat12_file_t *file, uint8_t *buf, uint16_t count) {
     uint16_t bytes_read = 0;
 
     while (bytes_read < count && file->position < file->file_size) {
+        if (file->current_cluster < 2 || file->current_cluster >= FAT12_TOTAL_CLUSTERS + 2)
+            return FAT12_ERR_INVALID;
         /* Calculate sector for current position */
         uint16_t offset_in_cluster = file->position % FAT12_BYTES_PER_SECTOR;
         uint16_t data_sector = FAT12_DATA_START + file->current_cluster - 2;
