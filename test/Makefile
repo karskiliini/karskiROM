@@ -32,7 +32,7 @@ ALL_OBJS = $(MOCK_OBJS) $(INFRA_OBJS) $(LIB6502_OBJ) $(VENDOR_OBJS)
 
 # ---- Test executables ----
 
-TESTS = test_bus_sim test_trace test_c64_harness \
+TESTS = test_fat12_bounds test_bus_sim test_trace test_c64_harness \
         test_iec_low test_iec_high test_jiffydos test_lz4_load
 
 .PHONY: all test clean
@@ -130,3 +130,7 @@ test_jiffydos: test_jiffydos.o
 # test_lz4_load: standalone scaffold
 test_lz4_load: test_lz4_load.o
 	$(CC) $(CFLAGS) -o $@ $^
+
+# Compile the real vendored FAT parser, rather than mock_fat12.o.
+test_fat12_bounds: test_fat12_bounds.c $(VPATH_VENDOR)/fat12.c
+	$(CC) $(CFLAGS) -DNANO $(INCS) -o $@ $^
